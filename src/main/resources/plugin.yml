@@ -1,0 +1,4 @@
+name: TakeItOutPlugin
+version: '1.0-SNAPSHOT'
+main: net.maxbel.takeItOutPlugin.TakeItOutPlugin
+api-version: '1.21'
