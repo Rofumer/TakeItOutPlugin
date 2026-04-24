@@ -1,19 +1,38 @@
 package net.maxbel.takeItOutPlugin;
 
-import org.bukkit.event.Listener;
 import org.bukkit.plugin.java.JavaPlugin;
 
-public final class TakeItOutPlugin extends JavaPlugin implements Listener {
+public final class TakeItOutPlugin extends JavaPlugin {
+
+    private TakeItOutChannelListener channelListener;
 
     @Override
     public void onEnable() {
-        // Plugin startup logic
-        this.getServer().getMessenger().registerIncomingPluginChannel(this, "takeitout:getstack", new CommandGetStack());
+        channelListener = new TakeItOutChannelListener(this);
 
+        getServer().getMessenger().registerIncomingPluginChannel(
+                this,
+                TakeItOutChannelListener.GET_STACK_CHANNEL,
+                channelListener
+        );
+        getServer().getMessenger().registerIncomingPluginChannel(
+                this,
+                TakeItOutChannelListener.GET_WORLD_CONTAINER_STACK_CHANNEL,
+                channelListener
+        );
+        getServer().getMessenger().registerIncomingPluginChannel(
+                this,
+                TakeItOutChannelListener.GET_WORLD_CONTAINER_ITEMS_CHANNEL,
+                channelListener
+        );
+
+        getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.WORLD_CONTAINER_STACK_RESPONSE_CHANNEL);
+        getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.WORLD_CONTAINER_ITEMS_CHANNEL);
     }
 
     @Override
     public void onDisable() {
-        // Plugin shutdown logic
+        getServer().getMessenger().unregisterIncomingPluginChannel(this);
+        getServer().getMessenger().unregisterOutgoingPluginChannel(this);
     }
 }
