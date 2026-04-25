@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'net.maxbel'
-version = '1.03'
+version = '1.04'
 
 repositories {
     mavenCentral()
@@ -19,6 +19,7 @@ repositories {
 
 dependencies {
     compileOnly("org.spigotmc:spigot-api:1.21-R0.1-SNAPSHOT")
+    compileOnly("com.google.code.gson:gson:2.10.1")
 }
 
 def targetJavaVersion = 21

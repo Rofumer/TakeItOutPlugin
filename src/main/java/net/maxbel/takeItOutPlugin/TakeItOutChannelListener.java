@@ -1,13 +1,18 @@
 package net.maxbel.takeItOutPlugin;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.Tag;
 import org.bukkit.World;
 import org.bukkit.block.Barrel;
 import org.bukkit.block.BlockState;
 import org.bukkit.block.Chest;
-import org.bukkit.block.EnderChest;
 import org.bukkit.block.ShulkerBox;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
@@ -19,11 +24,17 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.plugin.messaging.PluginMessageListener;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.logging.Level;
 
 public final class TakeItOutChannelListener implements PluginMessageListener {
@@ -37,13 +48,21 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     private static final int PLAYER_MAIN_INVENTORY_LIMIT = 36;
     private static final int SHULKER_SIZE = 27;
     private static final int MAX_SOURCE_POSITIONS = 64;
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final String LINKED_CONTAINER_EXCHANGE_MODE_KEY = "linked_container_exchange_mode";
+    private static final String ALLOWED_EXCHANGE_DIMENSIONS_KEY = "allowed_exchange_dimensions";
 
     private final JavaPlugin plugin;
     private final MinecraftItemStackCodec itemStackCodec;
+    private final Path serverConfigPath;
+    private final Set<String> allowedExchangeDimensions = new HashSet<>();
+    private LinkedContainerExchangeMode linkedContainerExchangeMode = LinkedContainerExchangeMode.CROSS_DIMENSION;
 
     public TakeItOutChannelListener(JavaPlugin plugin) {
         this.plugin = plugin;
         this.itemStackCodec = new MinecraftItemStackCodec();
+        this.serverConfigPath = plugin.getDataFolder().toPath().resolve("takeitout-server.json");
+        loadServerConfig();
     }
 
     @Override
@@ -174,11 +193,11 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
     private void handleGetWorldContainerStack(Player player, byte[] message) {
         PacketReader reader = new PacketReader(message);
-        long[] sourcePositions = reader.readLongArray(MAX_SOURCE_POSITIONS);
+        List<WorldContainerSource> sources = reader.readWorldContainerSources(MAX_SOURCE_POSITIONS);
         ItemStack requested = itemStackCodec.decode(reader);
         boolean singleItemMode = reader.readBoolean();
 
-        if (requested == null || isEmpty(requested) || sourcePositions == null) {
+        if (requested == null || isEmpty(requested) || sources == null) {
             return;
         }
 
@@ -187,12 +206,12 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         int emptySourceCount = 0;
         int failedExtractCount = 0;
 
-        for (long packedPos : sourcePositions) {
+        for (WorldContainerSource source : sources) {
             if (checked++ >= MAX_SOURCE_POSITIONS) {
                 break;
             }
 
-            Inventory inventory = getWorldContainerInventory(player, packedPos);
+            Inventory inventory = getWorldContainerInventory(player, source);
             if (inventory == null) {
                 invalidSourceCount++;
                 continue;
@@ -215,7 +234,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         plugin.getLogger().warning(
                 "GetWorldContainerStack miss: player=" + player.getName()
                         + ", requested=" + requested
-                        + ", sources=" + Math.min(sourcePositions.length, MAX_SOURCE_POSITIONS)
+                        + ", sources=" + Math.min(sources.size(), MAX_SOURCE_POSITIONS)
                         + ", invalidSources=" + invalidSourceCount
                         + ", noMatchingStack=" + emptySourceCount
                         + ", failedExtract=" + failedExtractCount
@@ -224,23 +243,23 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
     private void handleGetWorldContainerItems(Player player, byte[] message) {
         PacketReader reader = new PacketReader(message);
-        long[] sourcePositions = reader.readLongArray(MAX_SOURCE_POSITIONS);
+        List<WorldContainerSource> sources = reader.readWorldContainerSources(MAX_SOURCE_POSITIONS);
 
         List<WorldContainerItemCount> items = new ArrayList<>();
         List<WorldContainerContents> containers = new ArrayList<>();
 
-        if (sourcePositions == null) {
+        if (sources == null) {
             sendWorldContainerItems(player, items, containers);
             return;
         }
 
         int checked = 0;
-        for (long packedPos : sourcePositions) {
+        for (WorldContainerSource source : sources) {
             if (checked++ >= MAX_SOURCE_POSITIONS) {
                 break;
             }
 
-            Inventory inventory = getWorldContainerInventory(player, packedPos);
+            Inventory inventory = getWorldContainerInventory(player, source);
             List<WorldContainerItemCount> containerItems = new ArrayList<>();
 
             if (inventory != null) {
@@ -255,7 +274,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 }
             }
 
-            containers.add(new WorldContainerContents(packedPos, containerItems));
+            containers.add(new WorldContainerContents(source, containerItems));
         }
 
         sendWorldContainerItems(player, items, containers);
@@ -344,9 +363,13 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         return false;
     }
 
-    private Inventory getWorldContainerInventory(Player player, long packedPosition) {
-        PackedBlockPos pos = PackedBlockPos.unpack(packedPosition);
-        World world = player.getWorld();
+    private Inventory getWorldContainerInventory(Player player, WorldContainerSource source) {
+        World world = getSourceWorld(player, source);
+        if (world == null) {
+            return null;
+        }
+
+        PackedBlockPos pos = PackedBlockPos.unpack(source.position());
 
         if (pos.y < world.getMinHeight() || pos.y >= world.getMaxHeight()) {
             return null;
@@ -371,6 +394,69 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         return null;
     }
 
+    private World getSourceWorld(Player player, WorldContainerSource source) {
+        if (source == null || source.dimension() == null || source.dimension().isBlank()) {
+            return null;
+        }
+
+        String playerDimension = player.getWorld().getKey().toString();
+        if (linkedContainerExchangeMode == LinkedContainerExchangeMode.DISABLED) {
+            plugin.getLogger().warning(
+                    "World container source blocked by server config: player=" + player.getName()
+                            + ", reason=disabled"
+                            + ", playerDimension=" + playerDimension
+                            + ", sourceDimension=" + source.dimension()
+                            + ", pos=" + PackedBlockPos.unpack(source.position())
+            );
+            return null;
+        }
+
+        if (linkedContainerExchangeMode == LinkedContainerExchangeMode.SAME_DIMENSION
+                && !playerDimension.equals(source.dimension())) {
+            plugin.getLogger().warning(
+                    "World container source blocked by server config: player=" + player.getName()
+                            + ", reason=same_dimension_only"
+                            + ", playerDimension=" + playerDimension
+                            + ", sourceDimension=" + source.dimension()
+                            + ", pos=" + PackedBlockPos.unpack(source.position())
+            );
+            return null;
+        }
+
+        if (!isDimensionAllowedForExchange(playerDimension) || !isDimensionAllowedForExchange(source.dimension())) {
+            plugin.getLogger().warning(
+                    "World container source blocked by server config: player=" + player.getName()
+                            + ", playerDimension=" + playerDimension
+                            + ", sourceDimension=" + source.dimension()
+                            + ", pos=" + PackedBlockPos.unpack(source.position())
+            );
+            return null;
+        }
+
+        if (!isValidDimensionId(source.dimension())) {
+            return null;
+        }
+
+        for (World world : Bukkit.getWorlds()) {
+            if (world.getKey().toString().equals(source.dimension())) {
+                return world;
+            }
+        }
+        return null;
+    }
+
+    private boolean isDimensionAllowedForExchange(String dimension) {
+        return allowedExchangeDimensions.isEmpty() || allowedExchangeDimensions.contains(dimension);
+    }
+
+    private boolean isValidDimensionId(String dimension) {
+        try {
+            return NamespacedKey.fromString(dimension) != null;
+        } catch (IllegalArgumentException exception) {
+            return false;
+        }
+    }
+
     private void sendWorldContainerStackResponse(Player player, ItemStack stack, boolean success) {
         PacketWriter writer = new PacketWriter();
         itemStackCodec.encode(writer, stack);
@@ -392,7 +478,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
         writer.writeVarInt(containers.size());
         for (WorldContainerContents container : containers) {
-            writer.writeLong(container.sourcePosition());
+            writer.writeWorldContainerSource(container.source());
             writer.writeVarInt(container.items().size());
             for (WorldContainerItemCount item : container.items()) {
                 itemStackCodec.encode(writer, item.stack());
@@ -581,10 +667,80 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         player.updateInventory();
     }
 
+    private void loadServerConfig() {
+        allowedExchangeDimensions.clear();
+        linkedContainerExchangeMode = LinkedContainerExchangeMode.CROSS_DIMENSION;
+
+        if (!Files.exists(serverConfigPath)) {
+            saveDefaultServerConfig();
+            plugin.getLogger().info("Server config created: " + serverConfigPath);
+            return;
+        }
+
+        try {
+            JsonObject root = GSON.fromJson(Files.readString(serverConfigPath), JsonObject.class);
+            if (root == null
+                    || !root.has(ALLOWED_EXCHANGE_DIMENSIONS_KEY)
+                    || !root.get(ALLOWED_EXCHANGE_DIMENSIONS_KEY).isJsonArray()) {
+                saveDefaultServerConfig();
+                return;
+            }
+
+            if (root.has(LINKED_CONTAINER_EXCHANGE_MODE_KEY)) {
+                linkedContainerExchangeMode = LinkedContainerExchangeMode.fromString(
+                        root.get(LINKED_CONTAINER_EXCHANGE_MODE_KEY).getAsString(),
+                        plugin
+                );
+            }
+
+            JsonArray allowedDimensions = root.getAsJsonArray(ALLOWED_EXCHANGE_DIMENSIONS_KEY);
+            for (JsonElement element : allowedDimensions) {
+                if (!element.isJsonPrimitive()) {
+                    continue;
+                }
+
+                String dimension = element.getAsString();
+                if (dimension == null || dimension.isBlank()) {
+                    continue;
+                }
+
+                if (isValidDimensionId(dimension)) {
+                    allowedExchangeDimensions.add(dimension);
+                } else {
+                    plugin.getLogger().warning("Ignoring invalid TakeItOut exchange dimension in server config: " + dimension);
+                }
+            }
+
+            plugin.getLogger().info(
+                    "Server config loaded: linkedContainerExchangeMode=" + linkedContainerExchangeMode.id
+                            + ", allowedExchangeDimensions="
+                            + (allowedExchangeDimensions.isEmpty() ? "all" : allowedExchangeDimensions)
+            );
+        } catch (Exception exception) {
+            plugin.getLogger().log(Level.WARNING, "Failed to load TakeItOut server config, using defaults", exception);
+        }
+    }
+
+    private void saveDefaultServerConfig() {
+        JsonObject root = new JsonObject();
+        root.addProperty(LINKED_CONTAINER_EXCHANGE_MODE_KEY, linkedContainerExchangeMode.id);
+        root.add(ALLOWED_EXCHANGE_DIMENSIONS_KEY, new JsonArray());
+
+        try {
+            Files.createDirectories(serverConfigPath.getParent());
+            Files.writeString(serverConfigPath, GSON.toJson(root));
+        } catch (IOException exception) {
+            plugin.getLogger().log(Level.WARNING, "Failed to write TakeItOut server config", exception);
+        }
+    }
+
     private record WorldContainerItemCount(ItemStack stack, int count) {
     }
 
-    private record WorldContainerContents(long sourcePosition, List<WorldContainerItemCount> items) {
+    private record WorldContainerSource(String dimension, long position) {
+    }
+
+    private record WorldContainerContents(WorldContainerSource source, List<WorldContainerItemCount> items) {
     }
 
     private record PackedBlockPos(int x, int y, int z) {
@@ -593,6 +749,31 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             int y = (int) (value << 52 >> 52);
             int z = (int) (value << 26 >> 38);
             return new PackedBlockPos(x, y, z);
+        }
+    }
+
+    private enum LinkedContainerExchangeMode {
+        DISABLED("disabled"),
+        SAME_DIMENSION("same_dimension"),
+        CROSS_DIMENSION("cross_dimension");
+
+        private final String id;
+
+        LinkedContainerExchangeMode(String id) {
+            this.id = id;
+        }
+
+        private static LinkedContainerExchangeMode fromString(String value, JavaPlugin plugin) {
+            if (value != null) {
+                for (LinkedContainerExchangeMode mode : values()) {
+                    if (mode.id.equalsIgnoreCase(value) || mode.name().equalsIgnoreCase(value)) {
+                        return mode;
+                    }
+                }
+            }
+
+            plugin.getLogger().warning("Invalid linked container exchange mode '" + value + "', using " + CROSS_DIMENSION.id);
+            return CROSS_DIMENSION;
         }
     }
 
@@ -633,6 +814,21 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             return data[index++] != 0;
         }
 
+        private String readString() {
+            int byteLength = readVarInt();
+            if (byteLength < 0 || byteLength > Short.MAX_VALUE * 4) {
+                throw new IllegalArgumentException("String length out of range: " + byteLength);
+            }
+
+            ensureAvailable(byteLength);
+            String value = new String(data, index, byteLength, StandardCharsets.UTF_8);
+            index += byteLength;
+            if (value.length() > Short.MAX_VALUE) {
+                throw new IllegalArgumentException("String is too long");
+            }
+            return value;
+        }
+
         private int readVarInt() {
             int value = 0;
             int position = 0;
@@ -652,15 +848,15 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             }
         }
 
-        private long[] readLongArray(int maxSize) {
+        private List<WorldContainerSource> readWorldContainerSources(int maxSize) {
             int length = readVarInt();
             if (length < 0 || length > maxSize) {
-                throw new IllegalArgumentException("Long array length out of range: " + length);
+                throw new IllegalArgumentException("World container source list length out of range: " + length);
             }
 
-            long[] result = new long[length];
+            List<WorldContainerSource> result = new ArrayList<>(length);
             for (int i = 0; i < length; i++) {
-                result[i] = readLong();
+                result.add(new WorldContainerSource(readString(), readLong()));
             }
             return result;
         }
@@ -701,6 +897,16 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             output.write(value ? 1 : 0);
         }
 
+        private void writeString(String value) {
+            byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+            if (bytes.length > Short.MAX_VALUE * 4) {
+                throw new IllegalArgumentException("String is too long");
+            }
+
+            writeVarInt(bytes.length);
+            writeBytes(bytes);
+        }
+
         private void writeVarInt(int value) {
             int current = value;
             while ((current & -128) != 0) {
@@ -712,6 +918,11 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
         private void writeBytes(byte[] bytes) {
             output.writeBytes(bytes);
+        }
+
+        private void writeWorldContainerSource(WorldContainerSource source) {
+            writeString(source.dimension());
+            writeLong(source.position());
         }
 
         private byte[] toByteArray() {
