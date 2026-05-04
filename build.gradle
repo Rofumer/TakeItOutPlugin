@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'net.maxbel'
-version = '1.04'
+version = '1.05'
 
 repositories {
     mavenCentral()

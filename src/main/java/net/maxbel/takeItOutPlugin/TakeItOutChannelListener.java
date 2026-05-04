@@ -48,8 +48,10 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     private static final int PLAYER_MAIN_INVENTORY_LIMIT = 36;
     private static final int SHULKER_SIZE = 27;
     private static final int MAX_SOURCE_POSITIONS = 64;
+    private static final int DEFAULT_LINKED_CONTAINER_SCAN_LIMIT = 64;
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final String LINKED_CONTAINER_EXCHANGE_MODE_KEY = "linked_container_exchange_mode";
+    private static final String LINKED_CONTAINER_SCAN_LIMIT_KEY = "linked_container_scan_limit";
     private static final String ALLOWED_EXCHANGE_DIMENSIONS_KEY = "allowed_exchange_dimensions";
 
     private final JavaPlugin plugin;
@@ -57,6 +59,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     private final Path serverConfigPath;
     private final Set<String> allowedExchangeDimensions = new HashSet<>();
     private LinkedContainerExchangeMode linkedContainerExchangeMode = LinkedContainerExchangeMode.CROSS_DIMENSION;
+    private int linkedContainerScanLimit = DEFAULT_LINKED_CONTAINER_SCAN_LIMIT;
 
     public TakeItOutChannelListener(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -193,7 +196,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
     private void handleGetWorldContainerStack(Player player, byte[] message) {
         PacketReader reader = new PacketReader(message);
-        List<WorldContainerSource> sources = reader.readWorldContainerSources(MAX_SOURCE_POSITIONS);
+        List<WorldContainerSource> sources = reader.readWorldContainerSources(maxSourcePositionsToRead());
         ItemStack requested = itemStackCodec.decode(reader);
         boolean singleItemMode = reader.readBoolean();
 
@@ -205,11 +208,13 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         int invalidSourceCount = 0;
         int emptySourceCount = 0;
         int failedExtractCount = 0;
+        int scanLimit = linkedContainerScanLimit;
 
         for (WorldContainerSource source : sources) {
-            if (checked++ >= MAX_SOURCE_POSITIONS) {
+            if (checked >= scanLimit) {
                 break;
             }
+            checked++;
 
             Inventory inventory = getWorldContainerInventory(player, source);
             if (inventory == null) {
@@ -234,7 +239,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         plugin.getLogger().warning(
                 "GetWorldContainerStack miss: player=" + player.getName()
                         + ", requested=" + requested
-                        + ", sources=" + Math.min(sources.size(), MAX_SOURCE_POSITIONS)
+                        + ", sources=" + Math.min(sources.size(), scanLimit)
                         + ", invalidSources=" + invalidSourceCount
                         + ", noMatchingStack=" + emptySourceCount
                         + ", failedExtract=" + failedExtractCount
@@ -243,7 +248,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
     private void handleGetWorldContainerItems(Player player, byte[] message) {
         PacketReader reader = new PacketReader(message);
-        List<WorldContainerSource> sources = reader.readWorldContainerSources(MAX_SOURCE_POSITIONS);
+        List<WorldContainerSource> sources = reader.readWorldContainerSources(maxSourcePositionsToRead());
 
         List<WorldContainerItemCount> items = new ArrayList<>();
         List<WorldContainerContents> containers = new ArrayList<>();
@@ -254,10 +259,12 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
 
         int checked = 0;
+        int scanLimit = linkedContainerScanLimit;
         for (WorldContainerSource source : sources) {
-            if (checked++ >= MAX_SOURCE_POSITIONS) {
+            if (checked >= scanLimit) {
                 break;
             }
+            checked++;
 
             Inventory inventory = getWorldContainerInventory(player, source);
             List<WorldContainerItemCount> containerItems = new ArrayList<>();
@@ -502,6 +509,10 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         items.add(new WorldContainerItemCount(key, stack.getAmount()));
     }
 
+    private int maxSourcePositionsToRead() {
+        return Math.max(MAX_SOURCE_POSITIONS, linkedContainerScanLimit);
+    }
+
     private int getSlotWithStack(Inventory inventory, ItemStack reference) {
         for (int i = 0; i < inventory.getSize(); i++) {
             ItemStack stack = inventory.getItem(i);
@@ -670,6 +681,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     private void loadServerConfig() {
         allowedExchangeDimensions.clear();
         linkedContainerExchangeMode = LinkedContainerExchangeMode.CROSS_DIMENSION;
+        linkedContainerScanLimit = DEFAULT_LINKED_CONTAINER_SCAN_LIMIT;
 
         if (!Files.exists(serverConfigPath)) {
             saveDefaultServerConfig();
@@ -693,6 +705,13 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 );
             }
 
+            if (root.has(LINKED_CONTAINER_SCAN_LIMIT_KEY)) {
+                linkedContainerScanLimit = parseLinkedContainerScanLimit(root.get(LINKED_CONTAINER_SCAN_LIMIT_KEY));
+            } else {
+                root.addProperty(LINKED_CONTAINER_SCAN_LIMIT_KEY, linkedContainerScanLimit);
+                saveServerConfig(root);
+            }
+
             JsonArray allowedDimensions = root.getAsJsonArray(ALLOWED_EXCHANGE_DIMENSIONS_KEY);
             for (JsonElement element : allowedDimensions) {
                 if (!element.isJsonPrimitive()) {
@@ -713,6 +732,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
             plugin.getLogger().info(
                     "Server config loaded: linkedContainerExchangeMode=" + linkedContainerExchangeMode.id
+                            + ", linkedContainerScanLimit=" + linkedContainerScanLimit
                             + ", allowedExchangeDimensions="
                             + (allowedExchangeDimensions.isEmpty() ? "all" : allowedExchangeDimensions)
             );
@@ -721,11 +741,47 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
     }
 
+    private int parseLinkedContainerScanLimit(JsonElement element) {
+        if (element == null || !element.isJsonPrimitive()) {
+            plugin.getLogger().warning(
+                    "Invalid TakeItOut linked container scan limit '" + element
+                            + "', using " + DEFAULT_LINKED_CONTAINER_SCAN_LIMIT
+            );
+            return DEFAULT_LINKED_CONTAINER_SCAN_LIMIT;
+        }
+
+        int limit;
+        try {
+            limit = element.getAsInt();
+        } catch (Exception exception) {
+            plugin.getLogger().warning(
+                    "Invalid TakeItOut linked container scan limit '" + element
+                            + "', using " + DEFAULT_LINKED_CONTAINER_SCAN_LIMIT
+            );
+            return DEFAULT_LINKED_CONTAINER_SCAN_LIMIT;
+        }
+
+        if (limit < 1) {
+            plugin.getLogger().warning(
+                    "Invalid TakeItOut linked container scan limit '" + limit
+                            + "', using " + DEFAULT_LINKED_CONTAINER_SCAN_LIMIT
+            );
+            return DEFAULT_LINKED_CONTAINER_SCAN_LIMIT;
+        }
+
+        return limit;
+    }
+
     private void saveDefaultServerConfig() {
         JsonObject root = new JsonObject();
         root.addProperty(LINKED_CONTAINER_EXCHANGE_MODE_KEY, linkedContainerExchangeMode.id);
+        root.addProperty(LINKED_CONTAINER_SCAN_LIMIT_KEY, linkedContainerScanLimit);
         root.add(ALLOWED_EXCHANGE_DIMENSIONS_KEY, new JsonArray());
 
+        saveServerConfig(root);
+    }
+
+    private void saveServerConfig(JsonObject root) {
         try {
             Files.createDirectories(serverConfigPath.getParent());
             Files.writeString(serverConfigPath, GSON.toJson(root));
