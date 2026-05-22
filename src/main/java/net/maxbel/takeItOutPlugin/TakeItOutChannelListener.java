@@ -1005,7 +1005,16 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 Object server = Bukkit.getServer();
                 Class<?> craftServerClass = server.getClass();
                 Object minecraftServer = craftServerClass.getMethod("getServer").invoke(server);
-                registryAccess = minecraftServer.getClass().getMethod("registryAccess").invoke(minecraftServer);
+                Object registryAccessTemp;
+                try {
+                    registryAccessTemp = minecraftServer.getClass().getMethod("registryAccess").invoke(minecraftServer);
+                } catch (NoSuchMethodException e) {
+                    // 1.21.5+: registryAccess() removed from MinecraftServer, get it from a world (ServerLevel)
+                    org.bukkit.World firstWorld = Bukkit.getWorlds().get(0);
+                    Object serverLevel = firstWorld.getClass().getMethod("getHandle").invoke(firstWorld);
+                    registryAccessTemp = serverLevel.getClass().getMethod("registryAccess").invoke(serverLevel);
+                }
+                registryAccess = registryAccessTemp;
 
                 String craftBukkitPackage = craftServerClass.getPackage().getName();
                 Class<?> craftItemStackClass = Class.forName(craftBukkitPackage + ".inventory.CraftItemStack");
