@@ -44,6 +44,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     public static final String GET_WORLD_CONTAINER_ITEMS_CHANNEL = "takeitout:get_world_container_items";
     public static final String WORLD_CONTAINER_STACK_RESPONSE_CHANNEL = "takeitout:world_container_stack_response";
     public static final String WORLD_CONTAINER_ITEMS_CHANNEL = "takeitout:world_container_items";
+    public static final String SERVER_CONFIG_SYNC_CHANNEL = "takeitout:server_config_sync";
 
     private static final int PLAYER_MAIN_INVENTORY_LIMIT = 36;
     private static final int SHULKER_SIZE = 27;
@@ -52,6 +53,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final String LINKED_CONTAINER_EXCHANGE_MODE_KEY = "linked_container_exchange_mode";
     private static final String LINKED_CONTAINER_SCAN_LIMIT_KEY = "linked_container_scan_limit";
+    private static final String ALLOW_ALL_ITEMS_TAKE_KEY = "allow_all_items_take";
     private static final String ALLOWED_EXCHANGE_DIMENSIONS_KEY = "allowed_exchange_dimensions";
 
     private final JavaPlugin plugin;
@@ -60,6 +62,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     private final Set<String> allowedExchangeDimensions = new HashSet<>();
     private LinkedContainerExchangeMode linkedContainerExchangeMode = LinkedContainerExchangeMode.CROSS_DIMENSION;
     private int linkedContainerScanLimit = DEFAULT_LINKED_CONTAINER_SCAN_LIMIT;
+    private boolean allowAllItemsTake = true;
 
     public TakeItOutChannelListener(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -199,8 +202,16 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         List<WorldContainerSource> sources = reader.readWorldContainerSources(maxSourcePositionsToRead());
         ItemStack requested = itemStackCodec.decode(reader);
         boolean singleItemMode = reader.readBoolean();
+        boolean fromUi = reader.hasRemaining() && reader.readBoolean();
 
         if (requested == null || isEmpty(requested) || sources == null) {
+            return;
+        }
+
+        if (fromUi && !allowAllItemsTake) {
+            player.spigot().sendMessage(net.md_5.bungee.api.ChatMessageType.ACTION_BAR,
+                    new net.md_5.bungee.api.chat.TextComponent("TakeItOut: taking items via All Items tab is disabled on this server"));
+            sendWorldContainerStackResponse(player, copySingle(requested), false);
             return;
         }
 
@@ -464,6 +475,12 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
     }
 
+    public void sendServerConfigSync(Player player) {
+        PacketWriter writer = new PacketWriter();
+        writer.writeVarInt(linkedContainerScanLimit);
+        player.sendPluginMessage(plugin, SERVER_CONFIG_SYNC_CHANNEL, writer.toByteArray());
+    }
+
     private void sendWorldContainerStackResponse(Player player, ItemStack stack, boolean success) {
         PacketWriter writer = new PacketWriter();
         itemStackCodec.encode(writer, stack);
@@ -712,6 +729,13 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 saveServerConfig(root);
             }
 
+            if (root.has(ALLOW_ALL_ITEMS_TAKE_KEY)) {
+                allowAllItemsTake = root.get(ALLOW_ALL_ITEMS_TAKE_KEY).getAsBoolean();
+            } else {
+                root.addProperty(ALLOW_ALL_ITEMS_TAKE_KEY, allowAllItemsTake);
+                saveServerConfig(root);
+            }
+
             JsonArray allowedDimensions = root.getAsJsonArray(ALLOWED_EXCHANGE_DIMENSIONS_KEY);
             for (JsonElement element : allowedDimensions) {
                 if (!element.isJsonPrimitive()) {
@@ -733,6 +757,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             plugin.getLogger().info(
                     "Server config loaded: linkedContainerExchangeMode=" + linkedContainerExchangeMode.id
                             + ", linkedContainerScanLimit=" + linkedContainerScanLimit
+                            + ", allowAllItemsTake=" + allowAllItemsTake
                             + ", allowedExchangeDimensions="
                             + (allowedExchangeDimensions.isEmpty() ? "all" : allowedExchangeDimensions)
             );
@@ -776,6 +801,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         JsonObject root = new JsonObject();
         root.addProperty(LINKED_CONTAINER_EXCHANGE_MODE_KEY, linkedContainerExchangeMode.id);
         root.addProperty(LINKED_CONTAINER_SCAN_LIMIT_KEY, linkedContainerScanLimit);
+        root.addProperty(ALLOW_ALL_ITEMS_TAKE_KEY, allowAllItemsTake);
         root.add(ALLOWED_EXCHANGE_DIMENSIONS_KEY, new JsonArray());
 
         saveServerConfig(root);

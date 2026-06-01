@@ -1,8 +1,11 @@
 package net.maxbel.takeItOutPlugin;
 
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
-public final class TakeItOutPlugin extends JavaPlugin {
+public final class TakeItOutPlugin extends JavaPlugin implements Listener {
 
     private TakeItOutChannelListener channelListener;
 
@@ -28,6 +31,14 @@ public final class TakeItOutPlugin extends JavaPlugin {
 
         getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.WORLD_CONTAINER_STACK_RESPONSE_CHANNEL);
         getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.WORLD_CONTAINER_ITEMS_CHANNEL);
+        getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.SERVER_CONFIG_SYNC_CHANNEL);
+
+        getServer().getPluginManager().registerEvents(this, this);
+    }
+
+    @EventHandler
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        channelListener.sendServerConfigSync(event.getPlayer());
     }
 
     @Override
