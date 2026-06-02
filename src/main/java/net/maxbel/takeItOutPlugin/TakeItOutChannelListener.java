@@ -90,6 +90,13 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
     }
 
+    private void notifyPacketError(Player player, int limit, IllegalArgumentException e) {
+        plugin.getLogger().warning("Rejected oversized packet from " + player.getName() + ": " + e.getMessage());
+        String msg = e.getMessage();
+        String actual = (msg != null && msg.contains(": ")) ? msg.substring(msg.lastIndexOf(": ") + 2) : "?";
+        player.sendMessage("§cTakeItOut: too many linked containers selected (" + actual + "/" + limit + ")");
+    }
+
     private void handleGetShulkerStack(Player player, byte[] message) {
         if (message.length < 8) {
             return;
@@ -199,7 +206,13 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
     private void handleGetWorldContainerStack(Player player, byte[] message) {
         PacketReader reader = new PacketReader(message);
-        List<WorldContainerSource> sources = reader.readWorldContainerSources(maxSourcePositionsToRead());
+        List<WorldContainerSource> sources;
+        try {
+            sources = reader.readWorldContainerSources(maxSourcePositionsToRead());
+        } catch (IllegalArgumentException e) {
+            notifyPacketError(player, maxSourcePositionsToRead(), e);
+            return;
+        }
         ItemStack requested = itemStackCodec.decode(reader);
         boolean singleItemMode = reader.readBoolean();
         boolean fromUi = reader.hasRemaining() && reader.readBoolean();
@@ -209,8 +222,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
 
         if (fromUi && !allowAllItemsTake) {
-            player.spigot().sendMessage(net.md_5.bungee.api.ChatMessageType.ACTION_BAR,
-                    new net.md_5.bungee.api.chat.TextComponent("TakeItOut: taking items via All Items tab is disabled on this server"));
+            player.sendMessage("§cTakeItOut: taking items via All Items tab is disabled on this server");
             sendWorldContainerStackResponse(player, copySingle(requested), false);
             return;
         }
@@ -259,7 +271,13 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
     private void handleGetWorldContainerItems(Player player, byte[] message) {
         PacketReader reader = new PacketReader(message);
-        List<WorldContainerSource> sources = reader.readWorldContainerSources(maxSourcePositionsToRead());
+        List<WorldContainerSource> sources;
+        try {
+            sources = reader.readWorldContainerSources(maxSourcePositionsToRead());
+        } catch (IllegalArgumentException e) {
+            notifyPacketError(player, maxSourcePositionsToRead(), e);
+            return;
+        }
 
         List<WorldContainerItemCount> items = new ArrayList<>();
         List<WorldContainerContents> containers = new ArrayList<>();
@@ -326,6 +344,20 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
 
         PlayerInventory playerInventory = player.getInventory();
+
+        int stackSlot = findPartialStack(playerInventory, extracted);
+        if (stackSlot != -1) {
+            ItemStack toUpdate = playerInventory.getItem(stackSlot).clone();
+            int canAdd = Math.min(extracted.getAmount(), toUpdate.getMaxStackSize() - toUpdate.getAmount());
+            if (canAdd >= extracted.getAmount()) {
+                inventory.setItem(slot, remainingInContainer);
+                toUpdate.setAmount(toUpdate.getAmount() + extracted.getAmount());
+                playerInventory.setItem(stackSlot, toUpdate);
+                syncPlayerInventory(player);
+                return true;
+            }
+        }
+
         ItemStack currentMainHand = cloneOrNull(playerInventory.getItemInMainHand());
 
         if (isEmpty(currentMainHand)) {
@@ -478,6 +510,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     public void sendServerConfigSync(Player player) {
         PacketWriter writer = new PacketWriter();
         writer.writeVarInt(linkedContainerScanLimit);
+        writer.writeBoolean(allowAllItemsTake);
         player.sendPluginMessage(plugin, SERVER_CONFIG_SYNC_CHANNEL, writer.toByteArray());
     }
 
@@ -534,6 +567,18 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         for (int i = 0; i < inventory.getSize(); i++) {
             ItemStack stack = inventory.getItem(i);
             if (!isEmpty(stack) && stack.isSimilar(reference)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private int findPartialStack(PlayerInventory inventory, ItemStack item) {
+        int limit = Math.min(PLAYER_MAIN_INVENTORY_LIMIT, inventory.getSize());
+        for (int i = 0; i < limit; i++) {
+            ItemStack existing = inventory.getItem(i);
+            if (!isEmpty(existing) && canStacksMerge(existing, item)
+                    && existing.getAmount() < existing.getMaxStackSize()) {
                 return i;
             }
         }
