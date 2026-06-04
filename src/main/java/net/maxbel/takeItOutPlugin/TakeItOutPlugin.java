@@ -28,6 +28,11 @@ public final class TakeItOutPlugin extends JavaPlugin implements Listener {
                 TakeItOutChannelListener.GET_WORLD_CONTAINER_ITEMS_CHANNEL,
                 channelListener
         );
+        getServer().getMessenger().registerIncomingPluginChannel(
+                this,
+                TakeItOutChannelListener.DUMP_INVENTORY_CHANNEL,
+                channelListener
+        );
 
         getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.WORLD_CONTAINER_STACK_RESPONSE_CHANNEL);
         getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.WORLD_CONTAINER_ITEMS_CHANNEL);

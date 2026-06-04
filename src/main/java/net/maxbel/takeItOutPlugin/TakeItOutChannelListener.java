@@ -42,6 +42,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     public static final String GET_STACK_CHANNEL = "takeitout:getstack";
     public static final String GET_WORLD_CONTAINER_STACK_CHANNEL = "takeitout:get_world_container_stack";
     public static final String GET_WORLD_CONTAINER_ITEMS_CHANNEL = "takeitout:get_world_container_items";
+    public static final String DUMP_INVENTORY_CHANNEL = "takeitout:dump_inventory";
     public static final String WORLD_CONTAINER_STACK_RESPONSE_CHANNEL = "takeitout:world_container_stack_response";
     public static final String WORLD_CONTAINER_ITEMS_CHANNEL = "takeitout:world_container_items";
     public static final String SERVER_CONFIG_SYNC_CHANNEL = "takeitout:server_config_sync";
@@ -82,6 +83,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 case GET_STACK_CHANNEL -> handleGetShulkerStack(player, message);
                 case GET_WORLD_CONTAINER_STACK_CHANNEL -> handleGetWorldContainerStack(player, message);
                 case GET_WORLD_CONTAINER_ITEMS_CHANNEL -> handleGetWorldContainerItems(player, message);
+                case DUMP_INVENTORY_CHANNEL -> handleDumpInventory(player, message);
                 default -> {
                 }
             }
@@ -216,6 +218,15 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         ItemStack requested = itemStackCodec.decode(reader);
         boolean singleItemMode = reader.readBoolean();
         boolean fromUi = reader.hasRemaining() && reader.readBoolean();
+        List<WorldContainerSource> dumps = new ArrayList<>();
+        if (reader.hasRemaining()) {
+            try {
+                dumps = reader.readWorldContainerSources(maxSourcePositionsToRead());
+            } catch (IllegalArgumentException e) {
+                notifyPacketError(player, maxSourcePositionsToRead(), e);
+                return;
+            }
+        }
 
         if (requested == null || isEmpty(requested) || sources == null) {
             return;
@@ -246,7 +257,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             }
 
             int slot = getSlotWithStack(inventory, requested);
-            if (slot != -1 && extractFromWorldContainer(player, inventory, slot, requested, singleItemMode)) {
+            if (slot != -1 && extractFromWorldContainer(player, inventory, slot, requested, singleItemMode, dumps)) {
                 sendWorldContainerStackResponse(player, copySingle(requested), true);
                 return;
             }
@@ -313,6 +324,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             containers.add(new WorldContainerContents(source, containerItems));
         }
 
+        sendServerConfigSync(player);
         sendWorldContainerItems(player, items, containers);
     }
 
@@ -321,7 +333,8 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             Inventory inventory,
             int slot,
             ItemStack requested,
-            boolean singleItemMode
+            boolean singleItemMode,
+            List<WorldContainerSource> dumps
     ) {
         if (slot < 0 || slot >= inventory.getSize()) {
             return false;
@@ -344,22 +357,9 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
 
         PlayerInventory playerInventory = player.getInventory();
-
-        int stackSlot = findPartialStack(playerInventory, extracted);
-        if (stackSlot != -1) {
-            ItemStack toUpdate = playerInventory.getItem(stackSlot).clone();
-            int canAdd = Math.min(extracted.getAmount(), toUpdate.getMaxStackSize() - toUpdate.getAmount());
-            if (canAdd >= extracted.getAmount()) {
-                inventory.setItem(slot, remainingInContainer);
-                toUpdate.setAmount(toUpdate.getAmount() + extracted.getAmount());
-                playerInventory.setItem(stackSlot, toUpdate);
-                syncPlayerInventory(player);
-                return true;
-            }
-        }
-
         ItemStack currentMainHand = cloneOrNull(playerInventory.getItemInMainHand());
 
+        // Case 1: main hand empty
         if (isEmpty(currentMainHand)) {
             inventory.setItem(slot, remainingInContainer);
             playerInventory.setItemInMainHand(extracted);
@@ -367,6 +367,36 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             return true;
         }
 
+        // Case 2: main hand has same item with space (partial merge)
+        if (canStacksMerge(currentMainHand, extracted) && currentMainHand.getAmount() < currentMainHand.getMaxStackSize()) {
+            int canAdd = Math.min(currentMainHand.getMaxStackSize() - currentMainHand.getAmount(), extracted.getAmount());
+            ItemStack actualRemaining = stackInContainer.clone();
+            actualRemaining.setAmount(actualRemaining.getAmount() - canAdd);
+            inventory.setItem(slot, actualRemaining.getAmount() <= 0 ? null : actualRemaining);
+            currentMainHand.setAmount(currentMainHand.getAmount() + canAdd);
+            playerInventory.setItemInMainHand(currentMainHand);
+            syncPlayerInventory(player);
+            return true;
+        }
+
+        // Case 3: inventory slot has partial stack of same item
+        int searchLimit = Math.min(PLAYER_MAIN_INVENTORY_LIMIT, playerInventory.getSize());
+        for (int i = 0; i < searchLimit; i++) {
+            ItemStack invStack = playerInventory.getItem(i);
+            if (!isEmpty(invStack) && canStacksMerge(invStack, extracted) && invStack.getAmount() < invStack.getMaxStackSize()) {
+                int canAdd = Math.min(invStack.getMaxStackSize() - invStack.getAmount(), extracted.getAmount());
+                ItemStack actualRemaining = stackInContainer.clone();
+                actualRemaining.setAmount(actualRemaining.getAmount() - canAdd);
+                inventory.setItem(slot, actualRemaining.getAmount() <= 0 ? null : actualRemaining);
+                invStack = invStack.clone();
+                invStack.setAmount(invStack.getAmount() + canAdd);
+                playerInventory.setItem(i, invStack);
+                syncPlayerInventory(player);
+                return true;
+            }
+        }
+
+        // Case 4: free slot exists
         int freeSlot = playerInventory.firstEmpty();
         if (freeSlot != -1) {
             inventory.setItem(slot, remainingInContainer);
@@ -376,24 +406,55 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             return true;
         }
 
+        // No free slot — tentatively update container slot
         inventory.setItem(slot, remainingInContainer);
-        if (canInsertIntoInventory(inventory, currentMainHand)) {
-            ItemStack leftover = insertIntoInventory(inventory, currentMainHand);
-            if (isEmpty(leftover)) {
+
+        // Case 5: main hand is replaceable — try to offload it into a dump or the source container
+        if (canReplaceInventoryItem(currentMainHand)) {
+            Inventory insertTarget = null;
+            for (WorldContainerSource dumpSource : dumps) {
+                Inventory dumpInv = getWorldContainerInventory(player, dumpSource);
+                if (dumpInv != null && canInsertIntoInventory(dumpInv, currentMainHand)) {
+                    insertTarget = dumpInv;
+                    break;
+                }
+            }
+            if (insertTarget == null && canInsertIntoInventory(inventory, currentMainHand)) {
+                insertTarget = inventory;
+            }
+            if (insertTarget != null) {
+                ItemStack leftover = insertIntoInventory(insertTarget, currentMainHand);
+                if (!isEmpty(leftover)) {
+                    inventory.setItem(slot, stackInContainer);
+                    return false;
+                }
                 playerInventory.setItemInMainHand(extracted);
                 syncPlayerInventory(player);
                 return true;
             }
         }
 
+        // Revert tentative update
         inventory.setItem(slot, stackInContainer);
 
+        // Case 6: slot was fully extracted — try replacing a replaceable inventory item
         if (remainingInContainer == null) {
-            int searchLimit = Math.min(PLAYER_MAIN_INVENTORY_LIMIT, playerInventory.getSize());
             for (int i = searchLimit - 1; i >= 0; --i) {
                 ItemStack item = playerInventory.getItem(i);
                 if (!canReplaceInventoryItem(item)) {
                     continue;
+                }
+
+                for (WorldContainerSource dumpSource : dumps) {
+                    Inventory dumpInv = getWorldContainerInventory(player, dumpSource);
+                    if (dumpInv != null && canInsertIntoInventory(dumpInv, item)) {
+                        insertIntoInventory(dumpInv, item);
+                        inventory.setItem(slot, null);
+                        playerInventory.setItem(i, currentMainHand);
+                        playerInventory.setItemInMainHand(extracted);
+                        syncPlayerInventory(player);
+                        return true;
+                    }
                 }
 
                 inventory.setItem(slot, item.clone());
@@ -510,7 +571,6 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     public void sendServerConfigSync(Player player) {
         PacketWriter writer = new PacketWriter();
         writer.writeVarInt(linkedContainerScanLimit);
-        writer.writeBoolean(allowAllItemsTake);
         player.sendPluginMessage(plugin, SERVER_CONFIG_SYNC_CHANNEL, writer.toByteArray());
     }
 
@@ -546,6 +606,50 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         player.sendPluginMessage(plugin, WORLD_CONTAINER_ITEMS_CHANNEL, writer.toByteArray());
     }
 
+    private void handleDumpInventory(Player player, byte[] message) {
+        PacketReader reader = new PacketReader(message);
+        List<WorldContainerSource> dumps;
+        try {
+            dumps = reader.readWorldContainerSources(maxSourcePositionsToRead());
+        } catch (IllegalArgumentException e) {
+            notifyPacketError(player, maxSourcePositionsToRead(), e);
+            return;
+        }
+
+        if (dumps == null || dumps.isEmpty()) {
+            return;
+        }
+
+        PlayerInventory playerInventory = player.getInventory();
+        int searchLimit = Math.min(PLAYER_MAIN_INVENTORY_LIMIT, playerInventory.getSize());
+
+        for (int i = 0; i < searchLimit; i++) {
+            ItemStack stack = playerInventory.getItem(i);
+            if (!canReplaceInventoryItem(stack)) {
+                continue;
+            }
+
+            ItemStack remaining = stack.clone();
+            for (WorldContainerSource dump : dumps) {
+                if (isEmpty(remaining)) {
+                    break;
+                }
+                Inventory dumpInventory = getWorldContainerInventory(player, dump);
+                if (dumpInventory == null) {
+                    continue;
+                }
+                remaining = insertIntoInventory(dumpInventory, remaining);
+            }
+
+            if (remaining == null || remaining.getAmount() != stack.getAmount()) {
+                playerInventory.setItem(i, isEmpty(remaining) ? null : remaining);
+            }
+        }
+
+        syncPlayerInventory(player);
+        plugin.getLogger().fine("DumpInventory: player=" + player.getName());
+    }
+
     private void addItemCount(List<WorldContainerItemCount> items, ItemStack stack) {
         ItemStack key = copySingle(stack);
         for (int i = 0; i < items.size(); i++) {
@@ -567,18 +671,6 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         for (int i = 0; i < inventory.getSize(); i++) {
             ItemStack stack = inventory.getItem(i);
             if (!isEmpty(stack) && stack.isSimilar(reference)) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    private int findPartialStack(PlayerInventory inventory, ItemStack item) {
-        int limit = Math.min(PLAYER_MAIN_INVENTORY_LIMIT, inventory.getSize());
-        for (int i = 0; i < limit; i++) {
-            ItemStack existing = inventory.getItem(i);
-            if (!isEmpty(existing) && canStacksMerge(existing, item)
-                    && existing.getAmount() < existing.getMaxStackSize()) {
                 return i;
             }
         }
