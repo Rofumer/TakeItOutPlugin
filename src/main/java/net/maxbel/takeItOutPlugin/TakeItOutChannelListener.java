@@ -670,7 +670,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     private int getSlotWithStack(Inventory inventory, ItemStack reference) {
         for (int i = 0; i < inventory.getSize(); i++) {
             ItemStack stack = inventory.getItem(i);
-            if (!isEmpty(stack) && stack.isSimilar(reference)) {
+            if (!isEmpty(stack) && stack.getType() == reference.getType()) {
                 return i;
             }
         }
