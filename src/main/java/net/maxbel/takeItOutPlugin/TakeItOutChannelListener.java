@@ -46,10 +46,14 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     public static final String WORLD_CONTAINER_STACK_RESPONSE_CHANNEL = "takeitout:world_container_stack_response";
     public static final String WORLD_CONTAINER_ITEMS_CHANNEL = "takeitout:world_container_items";
     public static final String SERVER_CONFIG_SYNC_CHANNEL = "takeitout:server_config_sync";
+    public static final String PUBLISH_GROUP_CHANNEL = "takeitout:publish_group";
+    public static final String UNPUBLISH_GROUP_CHANNEL = "takeitout:unpublish_group";
+    public static final String SHARED_GROUPS_LIST_CHANNEL = "takeitout:shared_groups_list";
 
     private static final int PLAYER_MAIN_INVENTORY_LIMIT = 36;
     private static final int SHULKER_SIZE = 27;
     private static final int MAX_SOURCE_POSITIONS = 64;
+    private static final int MAX_GROUPS_PER_PLAYER = 10;
     private static final int DEFAULT_LINKED_CONTAINER_SCAN_LIMIT = 64;
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final String LINKED_CONTAINER_EXCHANGE_MODE_KEY = "linked_container_exchange_mode";
@@ -60,6 +64,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     private final JavaPlugin plugin;
     private final MinecraftItemStackCodec itemStackCodec;
     private final Path serverConfigPath;
+    private final Path sharedGroupsPath;
     private final Set<String> allowedExchangeDimensions = new HashSet<>();
     private LinkedContainerExchangeMode linkedContainerExchangeMode = LinkedContainerExchangeMode.CROSS_DIMENSION;
     private int linkedContainerScanLimit = DEFAULT_LINKED_CONTAINER_SCAN_LIMIT;
@@ -69,6 +74,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         this.plugin = plugin;
         this.itemStackCodec = new MinecraftItemStackCodec();
         this.serverConfigPath = plugin.getDataFolder().toPath().resolve("takeitout-server.json");
+        this.sharedGroupsPath = plugin.getDataFolder().toPath().resolve("takeitout-shared-groups.json");
         loadServerConfig();
     }
 
@@ -84,6 +90,8 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 case GET_WORLD_CONTAINER_STACK_CHANNEL -> handleGetWorldContainerStack(player, message);
                 case GET_WORLD_CONTAINER_ITEMS_CHANNEL -> handleGetWorldContainerItems(player, message);
                 case DUMP_INVENTORY_CHANNEL -> handleDumpInventory(player, message);
+                case PUBLISH_GROUP_CHANNEL -> handlePublishGroup(player, message);
+                case UNPUBLISH_GROUP_CHANNEL -> handleUnpublishGroup(player, message);
                 default -> {
                 }
             }
@@ -325,6 +333,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
 
         sendServerConfigSync(player);
+        sendSharedGroupsList(player);
         sendWorldContainerItems(player, items, containers);
     }
 
@@ -604,6 +613,162 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
 
         player.sendPluginMessage(plugin, WORLD_CONTAINER_ITEMS_CHANNEL, writer.toByteArray());
+    }
+
+    private void handlePublishGroup(Player player, byte[] message) {
+        PacketReader reader = new PacketReader(message);
+        String name;
+        try {
+            name = reader.readString();
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        if (name == null || name.isBlank() || name.length() > 64) return;
+
+        int dimCount = reader.readVarInt();
+        if (dimCount < 0 || dimCount > 256) return;
+        List<SharedGroupDimension> dimensions = new ArrayList<>();
+        for (int i = 0; i < dimCount; i++) {
+            String dimension = reader.readString();
+            int srcCount = reader.readVarInt();
+            if (srcCount < 0 || srcCount > maxSourcePositionsToRead()) return;
+            List<SharedSourceEntry> sources = new ArrayList<>(srcCount);
+            for (int j = 0; j < srcCount; j++) {
+                long pos = reader.readLong();
+                boolean linked = reader.readBoolean();
+                sources.add(new SharedSourceEntry(pos, linked));
+            }
+            dimensions.add(new SharedGroupDimension(dimension, sources));
+        }
+
+        String playerId = player.getUniqueId().toString();
+        String playerName = player.getName();
+
+        List<SharedGroupEntry> groups = loadSharedGroups();
+        groups.removeIf(g -> g.authorId().equals(playerId) && g.name().equals(name));
+
+        long playerGroupCount = groups.stream().filter(g -> g.authorId().equals(playerId)).count();
+        if (playerGroupCount >= MAX_GROUPS_PER_PLAYER) {
+            player.sendMessage("§cTakeItOut: shared group limit reached (" + MAX_GROUPS_PER_PLAYER + ")");
+            return;
+        }
+
+        String groupId = java.util.UUID.randomUUID().toString();
+        groups.add(new SharedGroupEntry(groupId, name, playerName, playerId, dimensions));
+        saveSharedGroups(groups);
+        broadcastSharedGroups(groups);
+        player.sendMessage("§aTakeItOut: group \"" + name + "\" shared on server");
+    }
+
+    private void handleUnpublishGroup(Player player, byte[] message) {
+        PacketReader reader = new PacketReader(message);
+        String groupId;
+        try {
+            groupId = reader.readString();
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        if (groupId == null || groupId.isBlank()) return;
+
+        String playerId = player.getUniqueId().toString();
+        List<SharedGroupEntry> groups = loadSharedGroups();
+        boolean removed = groups.removeIf(g -> g.id().equals(groupId) && g.authorId().equals(playerId));
+
+        if (removed) {
+            saveSharedGroups(groups);
+            broadcastSharedGroups(groups);
+            player.sendMessage("§aTakeItOut: group removed from server");
+        }
+    }
+
+    public void sendSharedGroupsList(Player player) {
+        List<SharedGroupEntry> groups = loadSharedGroups();
+        PacketWriter writer = new PacketWriter();
+        writer.writeSharedGroups(groups);
+        player.sendPluginMessage(plugin, SHARED_GROUPS_LIST_CHANNEL, writer.toByteArray());
+    }
+
+    private void broadcastSharedGroups(List<SharedGroupEntry> groups) {
+        PacketWriter writer = new PacketWriter();
+        writer.writeSharedGroups(groups);
+        byte[] packet = writer.toByteArray();
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            p.sendPluginMessage(plugin, SHARED_GROUPS_LIST_CHANNEL, packet);
+        }
+    }
+
+    private List<SharedGroupEntry> loadSharedGroups() {
+        if (!Files.exists(sharedGroupsPath)) return new ArrayList<>();
+        try {
+            JsonArray arr = GSON.fromJson(Files.readString(sharedGroupsPath), JsonArray.class);
+            if (arr == null) return new ArrayList<>();
+            List<SharedGroupEntry> groups = new ArrayList<>();
+            for (JsonElement el : arr) {
+                if (!el.isJsonObject()) continue;
+                JsonObject obj = el.getAsJsonObject();
+                try {
+                    String id = obj.get("id").getAsString();
+                    String name = obj.get("name").getAsString();
+                    String authorName = obj.get("authorName").getAsString();
+                    String authorId = obj.get("authorId").getAsString();
+                    List<SharedGroupDimension> dimensions = new ArrayList<>();
+                    if (obj.has("dimensions") && obj.get("dimensions").isJsonArray()) {
+                        for (JsonElement dimEl : obj.getAsJsonArray("dimensions")) {
+                            if (!dimEl.isJsonObject()) continue;
+                            JsonObject dimObj = dimEl.getAsJsonObject();
+                            String dimension = dimObj.get("dimension").getAsString();
+                            List<SharedSourceEntry> sources = new ArrayList<>();
+                            if (dimObj.has("sources") && dimObj.get("sources").isJsonArray()) {
+                                for (JsonElement srcEl : dimObj.getAsJsonArray("sources")) {
+                                    if (!srcEl.isJsonObject()) continue;
+                                    JsonObject srcObj = srcEl.getAsJsonObject();
+                                    sources.add(new SharedSourceEntry(srcObj.get("pos").getAsLong(), srcObj.get("linked").getAsBoolean()));
+                                }
+                            }
+                            dimensions.add(new SharedGroupDimension(dimension, sources));
+                        }
+                    }
+                    groups.add(new SharedGroupEntry(id, name, authorName, authorId, dimensions));
+                } catch (Exception ignored) {}
+            }
+            return groups;
+        } catch (Exception e) {
+            plugin.getLogger().log(Level.WARNING, "Failed to load shared groups", e);
+            return new ArrayList<>();
+        }
+    }
+
+    private void saveSharedGroups(List<SharedGroupEntry> groups) {
+        try {
+            Files.createDirectories(sharedGroupsPath.getParent());
+            JsonArray arr = new JsonArray();
+            for (SharedGroupEntry group : groups) {
+                JsonObject obj = new JsonObject();
+                obj.addProperty("id", group.id());
+                obj.addProperty("name", group.name());
+                obj.addProperty("authorName", group.authorName());
+                obj.addProperty("authorId", group.authorId());
+                JsonArray dims = new JsonArray();
+                for (SharedGroupDimension dim : group.dimensions()) {
+                    JsonObject dimObj = new JsonObject();
+                    dimObj.addProperty("dimension", dim.dimension());
+                    JsonArray sources = new JsonArray();
+                    for (SharedSourceEntry src : dim.sources()) {
+                        JsonObject srcObj = new JsonObject();
+                        srcObj.addProperty("pos", src.position());
+                        srcObj.addProperty("linked", src.linked());
+                        sources.add(srcObj);
+                    }
+                    dimObj.add("sources", sources);
+                    dims.add(dimObj);
+                }
+                obj.add("dimensions", dims);
+                arr.add(obj);
+            }
+            Files.writeString(sharedGroupsPath, GSON.toJson(arr));
+        } catch (IOException e) {
+            plugin.getLogger().log(Level.WARNING, "Failed to save shared groups", e);
+        }
     }
 
     private void handleDumpInventory(Player player, byte[] message) {
@@ -962,6 +1127,15 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     private record WorldContainerContents(WorldContainerSource source, List<WorldContainerItemCount> items) {
     }
 
+    private record SharedSourceEntry(long position, boolean linked) {
+    }
+
+    private record SharedGroupDimension(String dimension, List<SharedSourceEntry> sources) {
+    }
+
+    private record SharedGroupEntry(String id, String name, String authorName, String authorId, List<SharedGroupDimension> dimensions) {
+    }
+
     private record PackedBlockPos(int x, int y, int z) {
         private static PackedBlockPos unpack(long value) {
             int x = (int) (value >> 38);
@@ -1142,6 +1316,25 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         private void writeWorldContainerSource(WorldContainerSource source) {
             writeString(source.dimension());
             writeLong(source.position());
+        }
+
+        private void writeSharedGroups(List<SharedGroupEntry> groups) {
+            writeVarInt(groups.size());
+            for (SharedGroupEntry group : groups) {
+                writeString(group.id());
+                writeString(group.name());
+                writeString(group.authorName());
+                writeString(group.authorId());
+                writeVarInt(group.dimensions().size());
+                for (SharedGroupDimension dim : group.dimensions()) {
+                    writeString(dim.dimension());
+                    writeVarInt(dim.sources().size());
+                    for (SharedSourceEntry src : dim.sources()) {
+                        writeLong(src.position());
+                        writeBoolean(src.linked());
+                    }
+                }
+            }
         }
 
         private byte[] toByteArray() {

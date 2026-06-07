@@ -33,17 +33,32 @@ public final class TakeItOutPlugin extends JavaPlugin implements Listener {
                 TakeItOutChannelListener.DUMP_INVENTORY_CHANNEL,
                 channelListener
         );
+        getServer().getMessenger().registerIncomingPluginChannel(
+                this,
+                TakeItOutChannelListener.PUBLISH_GROUP_CHANNEL,
+                channelListener
+        );
+        getServer().getMessenger().registerIncomingPluginChannel(
+                this,
+                TakeItOutChannelListener.UNPUBLISH_GROUP_CHANNEL,
+                channelListener
+        );
 
         getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.WORLD_CONTAINER_STACK_RESPONSE_CHANNEL);
         getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.WORLD_CONTAINER_ITEMS_CHANNEL);
         getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.SERVER_CONFIG_SYNC_CHANNEL);
+        getServer().getMessenger().registerOutgoingPluginChannel(this, TakeItOutChannelListener.SHARED_GROUPS_LIST_CHANNEL);
 
         getServer().getPluginManager().registerEvents(this, this);
     }
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
-        channelListener.sendServerConfigSync(event.getPlayer());
+        var player = event.getPlayer();
+        getServer().getScheduler().runTaskLater(this, () -> {
+            channelListener.sendServerConfigSync(player);
+            channelListener.sendSharedGroupsList(player);
+        }, 1L);
     }
 
     @Override
