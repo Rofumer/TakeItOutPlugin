@@ -1,7 +1,5 @@
-## New Features
-
-- Added support for shared container groups — players can now publish their groups to the server and import groups shared by others (requires TakeItOut mod 1.11+)
-
 ## Bug Fixes
 
-- Fixed scan limit not showing in the Containers tab header ("Linked: 2" instead of "Linked: 2/64") after the first login
+- Fixed shulker boxes not being extracted from linked containers when searching for items stored inside them
+- Fixed items with custom NBT/components being grouped separately in the All Items tab instead of merging by type
+- Fixed searching for a specific shulker box type in a container not matching by full identity

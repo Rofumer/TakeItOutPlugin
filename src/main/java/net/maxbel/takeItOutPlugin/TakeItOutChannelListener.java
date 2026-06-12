@@ -265,7 +265,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             }
 
             int slot = getSlotWithStack(inventory, requested);
-            if (slot != -1 && extractFromWorldContainer(player, inventory, slot, requested, singleItemMode, dumps)) {
+            if (slot != -1 && extractFromWorldContainer(player, inventory, slot, singleItemMode, dumps)) {
                 sendWorldContainerStackResponse(player, copySingle(requested), true);
                 return;
             }
@@ -274,6 +274,50 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 emptySourceCount++;
             } else {
                 failedExtractCount++;
+            }
+        }
+
+        // Second pass: item not found directly — find a shulker box containing the most of the requested item
+        if (!isShulkerBoxItem(requested)) {
+            int bestShulkerSlot = -1;
+            int bestShulkerCount = 0;
+            Inventory bestShulkerInventory = null;
+
+            int scanned = 0;
+            for (WorldContainerSource source : sources) {
+                if (scanned >= scanLimit) break;
+                scanned++;
+
+                Inventory inventory = getWorldContainerInventory(player, source);
+                if (inventory == null) continue;
+
+                for (int i = 0; i < inventory.getSize(); i++) {
+                    ItemStack stack = inventory.getItem(i);
+                    if (isEmpty(stack) || !isShulkerBoxItem(stack)) continue;
+
+                    ItemMeta meta = stack.getItemMeta();
+                    if (!(meta instanceof BlockStateMeta blockStateMeta)) continue;
+                    BlockState blockState = blockStateMeta.getBlockState();
+                    if (!(blockState instanceof ShulkerBox shulkerBox)) continue;
+
+                    int count = 0;
+                    for (ItemStack shulkerItem : shulkerBox.getInventory().getContents()) {
+                        if (!isEmpty(shulkerItem) && shulkerItem.getType() == requested.getType()) {
+                            count += shulkerItem.getAmount();
+                        }
+                    }
+
+                    if (count > bestShulkerCount) {
+                        bestShulkerCount = count;
+                        bestShulkerSlot = i;
+                        bestShulkerInventory = inventory;
+                    }
+                }
+            }
+
+            if (bestShulkerSlot != -1 && extractFromWorldContainer(player, bestShulkerInventory, bestShulkerSlot, true, dumps)) {
+                sendWorldContainerStackResponse(player, copySingle(requested), true);
+                return;
             }
         }
 
@@ -341,7 +385,6 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             Player player,
             Inventory inventory,
             int slot,
-            ItemStack requested,
             boolean singleItemMode,
             List<WorldContainerSource> dumps
     ) {
@@ -350,7 +393,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
 
         ItemStack stackInContainer = inventory.getItem(slot);
-        if (isEmpty(stackInContainer) || !canStacksMerge(stackInContainer, requested)) {
+        if (isEmpty(stackInContainer)) {
             return false;
         }
 
@@ -817,9 +860,13 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
     private void addItemCount(List<WorldContainerItemCount> items, ItemStack stack) {
         ItemStack key = copySingle(stack);
+        boolean shulker = isShulkerBoxItem(stack);
         for (int i = 0; i < items.size(); i++) {
             WorldContainerItemCount existing = items.get(i);
-            if (existing.stack().isSimilar(key)) {
+            boolean matches = shulker
+                    ? existing.stack().isSimilar(key)
+                    : existing.stack().getType() == key.getType();
+            if (matches) {
                 items.set(i, new WorldContainerItemCount(existing.stack(), existing.count() + stack.getAmount()));
                 return;
             }
@@ -833,10 +880,14 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     }
 
     private int getSlotWithStack(Inventory inventory, ItemStack reference) {
+        boolean shulker = isShulkerBoxItem(reference);
         for (int i = 0; i < inventory.getSize(); i++) {
             ItemStack stack = inventory.getItem(i);
-            if (!isEmpty(stack) && stack.getType() == reference.getType()) {
-                return i;
+            if (!isEmpty(stack)) {
+                boolean matches = shulker
+                        ? stack.isSimilar(reference)
+                        : stack.getType() == reference.getType();
+                if (matches) return i;
             }
         }
         return -1;
