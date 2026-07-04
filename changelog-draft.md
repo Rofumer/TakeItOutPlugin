@@ -1,8 +1,3 @@
-## New Features
+## Bug Fixes
 
-- **Search inside shulker boxes** — when sending container contents to the client, shulker boxes are now grouped by full identity (type + contents) so the client can display them correctly
-- **Shulker boxes grouped by contents** — identical shulkers are now merged into a single entry when aggregating container items
-
-## Improvements
-
-- **Shulker fallback** — if the requested item isn't found directly in linked containers, the server will now extract a shulker box containing the most of that item
+- **Fixed plugin failing to enable on newer Paper builds** — the item stack encoder/decoder used for cross-server item transfer relied on a `CraftItemStack.asBukkitCopy` method signature that recent Paper builds changed; the plugin now detects the correct signature automatically and no longer crashes on startup

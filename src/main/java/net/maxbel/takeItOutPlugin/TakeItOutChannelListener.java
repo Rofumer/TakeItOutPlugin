@@ -1426,6 +1426,15 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 String craftBukkitPackage = craftServerClass.getPackage().getName();
                 Class<?> craftItemStackClass = Class.forName(craftBukkitPackage + ".inventory.CraftItemStack");
                 Class<?> nmsItemStackClass = Class.forName("net.minecraft.world.item.ItemStack");
+                Class<?> asBukkitCopyParamClass;
+                try {
+                    // 1.21.x+: public asBukkitCopy(ItemStack) may have become private in favor of an
+                    // ItemInstance-typed overload; ItemStack implements ItemInstance so it still binds.
+                    asBukkitCopyParamClass = Class.forName("net.minecraft.world.item.ItemInstance");
+                    craftItemStackClass.getMethod("asBukkitCopy", asBukkitCopyParamClass);
+                } catch (ReflectiveOperationException e) {
+                    asBukkitCopyParamClass = nmsItemStackClass;
+                }
                 Class<?> streamCodecClass = Class.forName("net.minecraft.network.codec.StreamCodec");
                 Class<?> byteBufClass = Class.forName("io.netty.buffer.ByteBuf");
                 Class<?> registryAccessClass = Class.forName("net.minecraft.core.RegistryAccess");
@@ -1440,7 +1449,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 byteBufReaderIndexMethod = byteBufClass.getMethod("readerIndex");
 
                 asNmsCopyMethod = craftItemStackClass.getMethod("asNMSCopy", ItemStack.class);
-                asBukkitCopyMethod = craftItemStackClass.getMethod("asBukkitCopy", nmsItemStackClass);
+                asBukkitCopyMethod = craftItemStackClass.getMethod("asBukkitCopy", asBukkitCopyParamClass);
 
                 streamCodec = nmsItemStackClass.getField("STREAM_CODEC").get(null);
                 streamCodecEncodeMethod = streamCodecClass.getMethod("encode", Object.class, Object.class);
