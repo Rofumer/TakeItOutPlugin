@@ -6,6 +6,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Tag;
@@ -13,6 +14,7 @@ import org.bukkit.World;
 import org.bukkit.block.Barrel;
 import org.bukkit.block.BlockState;
 import org.bukkit.block.Chest;
+import org.bukkit.block.DoubleChest;
 import org.bukkit.block.ShulkerBox;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
@@ -63,6 +65,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
     private final JavaPlugin plugin;
     private final MinecraftItemStackCodec itemStackCodec;
+    private final CoreProtectHook coreProtectHook;
     private final Path serverConfigPath;
     private final Path sharedGroupsPath;
     private final Set<String> allowedExchangeDimensions = new HashSet<>();
@@ -73,6 +76,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
     public TakeItOutChannelListener(JavaPlugin plugin) {
         this.plugin = plugin;
         this.itemStackCodec = new MinecraftItemStackCodec();
+        this.coreProtectHook = new CoreProtectHook(plugin);
         this.serverConfigPath = plugin.getDataFolder().toPath().resolve("takeitout-server.json");
         this.sharedGroupsPath = plugin.getDataFolder().toPath().resolve("takeitout-shared-groups.json");
         loadServerConfig();
@@ -258,14 +262,14 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             }
             checked++;
 
-            Inventory inventory = getWorldContainerInventory(player, source);
-            if (inventory == null) {
+            WorldContainer container = getWorldContainer(player, source);
+            if (container == null) {
                 invalidSourceCount++;
                 continue;
             }
 
-            int slot = getSlotWithStack(inventory, requested);
-            if (slot != -1 && extractFromWorldContainer(player, inventory, slot, singleItemMode, dumps)) {
+            int slot = getSlotWithStack(container.inventory(), requested);
+            if (slot != -1 && extractFromWorldContainer(player, container, slot, singleItemMode, dumps)) {
                 sendWorldContainerStackResponse(player, copySingle(requested), true);
                 return;
             }
@@ -281,15 +285,16 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         if (!isShulkerBoxItem(requested)) {
             int bestShulkerSlot = -1;
             int bestShulkerCount = 0;
-            Inventory bestShulkerInventory = null;
+            WorldContainer bestShulkerContainer = null;
 
             int scanned = 0;
             for (WorldContainerSource source : sources) {
                 if (scanned >= scanLimit) break;
                 scanned++;
 
-                Inventory inventory = getWorldContainerInventory(player, source);
-                if (inventory == null) continue;
+                WorldContainer container = getWorldContainer(player, source);
+                if (container == null) continue;
+                Inventory inventory = container.inventory();
 
                 for (int i = 0; i < inventory.getSize(); i++) {
                     ItemStack stack = inventory.getItem(i);
@@ -310,12 +315,12 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                     if (count > bestShulkerCount) {
                         bestShulkerCount = count;
                         bestShulkerSlot = i;
-                        bestShulkerInventory = inventory;
+                        bestShulkerContainer = container;
                     }
                 }
             }
 
-            if (bestShulkerSlot != -1 && extractFromWorldContainer(player, bestShulkerInventory, bestShulkerSlot, true, dumps)) {
+            if (bestShulkerSlot != -1 && extractFromWorldContainer(player, bestShulkerContainer, bestShulkerSlot, true, dumps)) {
                 sendWorldContainerStackResponse(player, copySingle(requested), true);
                 return;
             }
@@ -358,10 +363,11 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             }
             checked++;
 
-            Inventory inventory = getWorldContainerInventory(player, source);
+            WorldContainer container = getWorldContainer(player, source);
             List<WorldContainerItemCount> containerItems = new ArrayList<>();
 
-            if (inventory != null) {
+            if (container != null) {
+                Inventory inventory = container.inventory();
                 for (int slot = 0; slot < inventory.getSize(); slot++) {
                     ItemStack stack = inventory.getItem(slot);
                     if (isEmpty(stack)) {
@@ -383,11 +389,14 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
     private boolean extractFromWorldContainer(
             Player player,
-            Inventory inventory,
+            WorldContainer container,
             int slot,
             boolean singleItemMode,
             List<WorldContainerSource> dumps
     ) {
+        Inventory inventory = container.inventory();
+        Location containerLocation = container.location();
+
         if (slot < 0 || slot >= inventory.getSize()) {
             return false;
         }
@@ -413,6 +422,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
         // Case 1: main hand empty
         if (isEmpty(currentMainHand)) {
+            coreProtectHook.logContainerTransaction(player, containerLocation);
             inventory.setItem(slot, remainingInContainer);
             playerInventory.setItemInMainHand(extracted);
             syncPlayerInventory(player);
@@ -424,6 +434,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             int canAdd = Math.min(currentMainHand.getMaxStackSize() - currentMainHand.getAmount(), extracted.getAmount());
             ItemStack actualRemaining = stackInContainer.clone();
             actualRemaining.setAmount(actualRemaining.getAmount() - canAdd);
+            coreProtectHook.logContainerTransaction(player, containerLocation);
             inventory.setItem(slot, actualRemaining.getAmount() <= 0 ? null : actualRemaining);
             currentMainHand.setAmount(currentMainHand.getAmount() + canAdd);
             playerInventory.setItemInMainHand(currentMainHand);
@@ -439,6 +450,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 int canAdd = Math.min(invStack.getMaxStackSize() - invStack.getAmount(), extracted.getAmount());
                 ItemStack actualRemaining = stackInContainer.clone();
                 actualRemaining.setAmount(actualRemaining.getAmount() - canAdd);
+                coreProtectHook.logContainerTransaction(player, containerLocation);
                 inventory.setItem(slot, actualRemaining.getAmount() <= 0 ? null : actualRemaining);
                 invStack = invStack.clone();
                 invStack.setAmount(invStack.getAmount() + canAdd);
@@ -451,6 +463,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         // Case 4: free slot exists
         int freeSlot = playerInventory.firstEmpty();
         if (freeSlot != -1) {
+            coreProtectHook.logContainerTransaction(player, containerLocation);
             inventory.setItem(slot, remainingInContainer);
             playerInventory.setItem(freeSlot, currentMainHand);
             playerInventory.setItemInMainHand(extracted);
@@ -463,19 +476,26 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
         // Case 5: main hand is replaceable — try to offload it into a dump or the source container
         if (canReplaceInventoryItem(currentMainHand)) {
-            Inventory insertTarget = null;
+            WorldContainer insertTarget = null;
             for (WorldContainerSource dumpSource : dumps) {
-                Inventory dumpInv = getWorldContainerInventory(player, dumpSource);
-                if (dumpInv != null && canInsertIntoInventory(dumpInv, currentMainHand)) {
-                    insertTarget = dumpInv;
+                WorldContainer dumpContainer = getWorldContainer(player, dumpSource);
+                if (dumpContainer != null && canInsertIntoInventory(dumpContainer.inventory(), currentMainHand)) {
+                    insertTarget = dumpContainer;
                     break;
                 }
             }
             if (insertTarget == null && canInsertIntoInventory(inventory, currentMainHand)) {
-                insertTarget = inventory;
+                insertTarget = container;
             }
             if (insertTarget != null) {
-                ItemStack leftover = insertIntoInventory(insertTarget, currentMainHand);
+                inventory.setItem(slot, stackInContainer);
+                coreProtectHook.logContainerTransaction(player, containerLocation);
+                if (!insertTarget.location().equals(containerLocation)) {
+                    coreProtectHook.logContainerTransaction(player, insertTarget.location());
+                }
+                inventory.setItem(slot, remainingInContainer);
+
+                ItemStack leftover = insertIntoInventory(insertTarget.inventory(), currentMainHand);
                 if (!isEmpty(leftover)) {
                     inventory.setItem(slot, stackInContainer);
                     return false;
@@ -498,9 +518,13 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 }
 
                 for (WorldContainerSource dumpSource : dumps) {
-                    Inventory dumpInv = getWorldContainerInventory(player, dumpSource);
-                    if (dumpInv != null && canInsertIntoInventory(dumpInv, item)) {
-                        insertIntoInventory(dumpInv, item);
+                    WorldContainer dumpContainer = getWorldContainer(player, dumpSource);
+                    if (dumpContainer != null && canInsertIntoInventory(dumpContainer.inventory(), item)) {
+                        coreProtectHook.logContainerTransaction(player, containerLocation);
+                        if (!dumpContainer.location().equals(containerLocation)) {
+                            coreProtectHook.logContainerTransaction(player, dumpContainer.location());
+                        }
+                        insertIntoInventory(dumpContainer.inventory(), item);
                         inventory.setItem(slot, null);
                         playerInventory.setItem(i, currentMainHand);
                         playerInventory.setItemInMainHand(extracted);
@@ -509,6 +533,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                     }
                 }
 
+                coreProtectHook.logContainerTransaction(player, containerLocation);
                 inventory.setItem(slot, item.clone());
                 playerInventory.setItem(i, currentMainHand);
                 playerInventory.setItemInMainHand(extracted);
@@ -526,7 +551,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         return false;
     }
 
-    private Inventory getWorldContainerInventory(Player player, WorldContainerSource source) {
+    private WorldContainer getWorldContainer(Player player, WorldContainerSource source) {
         World world = getSourceWorld(player, source);
         if (world == null) {
             return null;
@@ -545,16 +570,23 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         }
 
         BlockState blockState = world.getBlockAt(pos.x, pos.y, pos.z).getState();
+        Inventory inventory;
         if (blockState instanceof Chest chest) {
-            return chest.getInventory();
+            inventory = chest.getInventory();
+        } else if (blockState instanceof ShulkerBox shulkerBox) {
+            inventory = shulkerBox.getInventory();
+        } else if (blockState instanceof Barrel barrel) {
+            inventory = barrel.getInventory();
+        } else {
+            return null;
         }
-        if (blockState instanceof ShulkerBox shulkerBox) {
-            return shulkerBox.getInventory();
+
+        Location location = blockState.getLocation();
+        if (inventory.getHolder() instanceof DoubleChest doubleChest
+                && doubleChest.getLeftSide() instanceof BlockState leftState) {
+            location = leftState.getLocation();
         }
-        if (blockState instanceof Barrel barrel) {
-            return barrel.getInventory();
-        }
-        return null;
+        return new WorldContainer(inventory, location);
     }
 
     private World getSourceWorld(Player player, WorldContainerSource source) {
@@ -830,6 +862,7 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
 
         PlayerInventory playerInventory = player.getInventory();
         int searchLimit = Math.min(PLAYER_MAIN_INVENTORY_LIMIT, playerInventory.getSize());
+        Set<Location> loggedContainers = new HashSet<>();
 
         for (int i = 0; i < searchLimit; i++) {
             ItemStack stack = playerInventory.getItem(i);
@@ -842,11 +875,17 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
                 if (isEmpty(remaining)) {
                     break;
                 }
-                Inventory dumpInventory = getWorldContainerInventory(player, dump);
-                if (dumpInventory == null) {
+                WorldContainer dumpContainer = getWorldContainer(player, dump);
+                if (dumpContainer == null) {
                     continue;
                 }
-                remaining = insertIntoInventory(dumpInventory, remaining);
+                if (!canInsertAnyIntoInventory(dumpContainer.inventory(), remaining)) {
+                    continue;
+                }
+                if (loggedContainers.add(dumpContainer.location())) {
+                    coreProtectHook.logContainerTransaction(player, dumpContainer.location());
+                }
+                remaining = insertIntoInventory(dumpContainer.inventory(), remaining);
             }
 
             if (remaining == null || remaining.getAmount() != stack.getAmount()) {
@@ -891,6 +930,27 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
             }
         }
         return -1;
+    }
+
+    private boolean canInsertAnyIntoInventory(Inventory inventory, ItemStack toInsert) {
+        if (isEmpty(toInsert)) {
+            return false;
+        }
+
+        for (int i = 0; i < inventory.getSize(); i++) {
+            ItemStack existing = inventory.getItem(i);
+            if (isEmpty(existing)) {
+                return true;
+            }
+            if (canStacksMerge(existing, toInsert)) {
+                int max = Math.min(existing.getMaxStackSize(), inventory.getMaxStackSize());
+                if (existing.getAmount() < max) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private boolean canInsertIntoInventory(Inventory inventory, ItemStack toInsert) {
@@ -1167,6 +1227,9 @@ public final class TakeItOutChannelListener implements PluginMessageListener {
         } catch (IOException exception) {
             plugin.getLogger().log(Level.WARNING, "Failed to write TakeItOut server config", exception);
         }
+    }
+
+    private record WorldContainer(Inventory inventory, Location location) {
     }
 
     private record WorldContainerItemCount(ItemStack stack, int count) {

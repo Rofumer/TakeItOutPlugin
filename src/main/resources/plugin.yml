@@ -2,3 +2,4 @@ name: TakeItOutPlugin
 version: '${version}'
 main: net.maxbel.takeItOutPlugin.TakeItOutPlugin
 api-version: '1.21'
+softdepend: [CoreProtect]
